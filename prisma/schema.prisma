@@ -1,0 +1,60 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  folders   Folder[]
+  files     File[]
+  createdAt DateTime @default(now())
+
+  @@map("users")
+}
+
+model Veiculo {
+  id     String @id @default(cuid())
+  modelo String
+  marca  String?
+
+  @@map("veiculos")
+}
+
+model Folder {
+  id          String   @id @default(cuid())
+  name        String
+  parentId    String?
+  parent      Folder?  @relation("FolderHierarchy", fields: [parentId], references: [id])
+  children    Folder[] @relation("FolderHierarchy")
+  files       File[]
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  createdAt   DateTime @default(now())
+  
+  @@map("folders")
+}
+
+// prisma/schema.prisma - ATUALIZAR modelo File
+model File {
+  id           String   @id @default(cuid())
+  name         String
+  originalName String
+  mimeType     String
+  size         Int
+  data         Bytes
+  path         String?  
+  folderId     String?
+  folder       Folder?  @relation(fields: [folderId], references: [id])
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  createdAt    DateTime @default(now())
+  
+  @@map("files")
+}
