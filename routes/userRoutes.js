@@ -270,6 +270,176 @@ router.get("/files/:id", async (req, res) => {
     res.status(500).json({ error: "Erro ao recuperar arquivo" });
   }
 });
+// ========== ROTA PARA UPLOAD DE MÚLTIPLOS ARQUIVOS ==========
+
+// 📤 UPLOAD DE MÚLTIPLOS ARQUIVOS
+router.post(
+  "/files/upload-multiple",
+  multiFilesUpload.array("files", 50),
+  async (req, res) => {
+    try {
+      const { folderId } = req.body;
+      const files = req.files;
+
+      console.log(
+        `📤 Iniciando upload múltiplo: ${files?.length || 0} arquivos`
+      );
+
+      if (!files || files.length === 0) {
+        return res.status(400).json({ error: "Nenhum arquivo enviado" });
+      }
+
+      const defaultUser = await getDefaultUser();
+      if (!defaultUser) {
+        return res
+          .status(400)
+          .json({ error: "Usuário padrão não configurado" });
+      }
+
+      // Processar cada arquivo
+      const uploadedFiles = [];
+      let totalSize = 0;
+
+      for (const file of files) {
+        try {
+          console.log(
+            `📎 Processando: ${file.originalname} (${file.size} bytes)`
+          );
+
+          const savedFile = await prisma.file.create({
+            data: {
+              name: file.originalname,
+              originalName: file.originalname,
+              mimeType: file.mimetype,
+              size: file.size,
+              data: file.buffer,
+              folderId: folderId || null,
+              userId: defaultUser.id,
+            },
+            select: {
+              id: true,
+              name: true,
+              mimeType: true,
+              size: true,
+              path: true,
+              createdAt: true,
+            },
+          });
+
+          uploadedFiles.push(savedFile);
+          totalSize += file.size;
+        } catch (fileError) {
+          console.error(`❌ Erro ao salvar ${file.originalname}:`, fileError);
+          // Continuar com outros arquivos mesmo se um falhar
+        }
+      }
+
+      console.log(
+        `✅ Upload múltiplo concluído: ${uploadedFiles.length}/${files.length} arquivos salvos`
+      );
+
+      res.status(201).json({
+        success: true,
+        message: `${uploadedFiles.length} arquivos uploadados com sucesso`,
+        files: uploadedFiles,
+        totalSize: totalSize,
+        failed: files.length - uploadedFiles.length,
+      });
+    } catch (error) {
+      console.error("❌ Erro no upload múltiplo:", error);
+      res.status(500).json({
+        error: "Erro no upload múltiplo: " + error.message,
+      });
+    }
+  }
+);
+
+// ========== ROTA ALTERNATIVA PARA UPLOAD MÚLTIPLO ==========
+
+// 📤 UPLOAD MÚLTIPLO ALTERNATIVO (FormData com field único)
+router.post(
+  "/files/upload-multiple-alt",
+  multiFilesUpload.any(),
+  async (req, res) => {
+    try {
+      const { folderId } = req.body;
+      const files = req.files;
+
+      console.log(
+        `📤 Upload múltiplo alternativo: ${files?.length || 0} arquivos`
+      );
+
+      if (!files || files.length === 0) {
+        return res.status(400).json({ error: "Nenhum arquivo enviado" });
+      }
+
+      const defaultUser = await getDefaultUser();
+      if (!defaultUser) {
+        return res
+          .status(400)
+          .json({ error: "Usuário padrão não configurado" });
+      }
+
+      const results = {
+        success: [],
+        failed: [],
+      };
+
+      for (const file of files) {
+        try {
+          const savedFile = await prisma.file.create({
+            data: {
+              name: file.originalname,
+              originalName: file.originalname,
+              mimeType: file.mimetype || getMimeType(file.originalname),
+              size: file.size,
+              data: file.buffer,
+              folderId: folderId || null,
+              userId: defaultUser.id,
+            },
+            select: {
+              id: true,
+              name: true,
+              mimeType: true,
+              size: true,
+              path: true,
+              createdAt: true,
+            },
+          });
+
+          results.success.push({
+            file: savedFile,
+            originalName: file.originalname,
+          });
+
+          console.log(`✅ Sucesso: ${file.originalname}`);
+        } catch (fileError) {
+          console.error(`❌ Falha: ${file.originalname}`, fileError);
+          results.failed.push({
+            originalName: file.originalname,
+            error: fileError.message,
+          });
+        }
+      }
+
+      res.status(201).json({
+        success: true,
+        message: `${results.success.length} arquivos processados com sucesso`,
+        uploaded: results.success.length,
+        failed: results.failed.length,
+        details: {
+          successful: results.success,
+          failed: results.failed,
+        },
+      });
+    } catch (error) {
+      console.error("❌ Erro no upload múltiplo alternativo:", error);
+      res.status(500).json({
+        error: "Erro no upload múltiplo: " + error.message,
+      });
+    }
+  }
+);
 
 //  ROTA PARA THUMBNAILS DE IMAGENS (OPCIONAL)
 router.get("/files/:id/thumbnail", async (req, res) => {
@@ -699,5 +869,32 @@ router.post(
   }
 );
 
+// ========== ROTA DE DEBUG ==========
+
+// 🔍 ROTA PARA VERIFICAR SE AS ROTAS ESTÃO FUNCIONANDO
+router.get("/debug/routes", (req, res) => {
+  const routes = [
+    "GET /api/folders/root",
+    "GET /api/folders/:id/light",
+    "GET /api/folders/:id/content-paginated",
+    "GET /api/files/:id",
+    "POST /api/files/upload",
+    "POST /api/files/upload-multiple", // NOVA
+    "POST /api/files/upload-multiple-alt", // NOVA
+    "POST /api/folders/upload-zip",
+    "POST /api/folders",
+    "PUT /api/folders/:id",
+    "PUT /api/files/:id",
+    "DELETE /api/files/:id",
+    "DELETE /api/folders/:id",
+    "DELETE /api/folders/:id/recursive",
+  ];
+
+  res.json({
+    message: "Rotas disponíveis",
+    routes: routes,
+    timestamp: new Date().toISOString(),
+  });
+});
 export { router };
 export default router;
