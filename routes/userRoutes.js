@@ -270,6 +270,70 @@ router.get("/files/:id", async (req, res) => {
     res.status(500).json({ error: "Erro ao recuperar arquivo" });
   }
 });
+
+// ========== ROTAS PARA SERVIR ARQUIVOS ==========
+
+// ✅ ROTA ESPECÍFICA PARA IMAGENS (NOVA)
+router.get("/images/:id", async (req, res) => {
+  try {
+    const file = await prisma.file.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!file) {
+      return res.status(404).json({ error: "Imagem não encontrada" });
+    }
+
+    if (!file.mimeType.startsWith("image/")) {
+      return res.status(400).json({ error: "Arquivo não é uma imagem" });
+    }
+
+    const buffer = Buffer.isBuffer(file.data)
+      ? file.data
+      : Buffer.from(file.data);
+
+    res.setHeader("Content-Type", file.mimeType);
+    res.setHeader("Content-Length", buffer.length);
+    res.setHeader("Cache-Control", "public, max-age=31536000");
+    res.setHeader("Content-Disposition", "inline");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    console.log(`🖼️ Servindo imagem: ${file.name} (${file.size} bytes)`);
+    res.send(buffer);
+  } catch (error) {
+    console.error("❌ Erro ao carregar imagem:", error);
+    res.status(500).json({ error: "Erro ao carregar imagem" });
+  }
+});
+
+// ROTA PARA SERVIR ARQUIVOS (APENAS QUANDO PRECISAR DO CONTEÚDO)
+router.get("/files/:id", async (req, res) => {
+  try {
+    const file = await prisma.file.findUnique({
+      where: { id: req.params.id },
+    });
+
+    if (!file) {
+      return res.status(404).json({ error: "Arquivo não encontrado" });
+    }
+
+    const buffer = Buffer.isBuffer(file.data)
+      ? file.data
+      : Buffer.from(file.data);
+
+    res.setHeader("Content-Type", file.mimeType);
+    res.setHeader("Content-Length", buffer.length);
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${file.originalName}"`
+    );
+
+    res.send(buffer);
+  } catch (error) {
+    console.error("❌ Erro ao recuperar arquivo:", error);
+    res.status(500).json({ error: "Erro ao recuperar arquivo" });
+  }
+});
 // ========== ROTA PARA UPLOAD DE MÚLTIPLOS ARQUIVOS ==========
 
 // 📤 UPLOAD DE MÚLTIPLOS ARQUIVOS
@@ -357,6 +421,9 @@ router.post(
 // ========== ROTA ALTERNATIVA PARA UPLOAD MÚLTIPLO ==========
 
 // 📤 UPLOAD MÚLTIPLO ALTERNATIVO (FormData com field único)
+// ========== ROTA ALTERNATIVA PARA UPLOAD MÚLTIPLO ==========
+
+// 📤 UPLOAD MÚLTIPLO ALTERNATIVO (FormData com field único)
 router.post(
   "/files/upload-multiple-alt",
   multiFilesUpload.any(),
@@ -440,7 +507,377 @@ router.post(
     }
   }
 );
+// ========== ROTA DE BUSCA GLOBAL ==========
 
+// 🔍 BUSCA GLOBAL EM TODOS OS ARQUIVOS E PASTAS
+router.get("/search", async (req, res) => {
+  try {
+    const {
+      q: query,
+      includeFiles = "true",
+      includeFolders = "true",
+    } = req.query;
+
+    console.log(`🔍 Busca global iniciada: "${query}"`);
+
+    if (!query || query.trim().length === 0) {
+      return res.json({
+        files: [],
+        folders: [],
+        message: "Termo de busca não fornecido",
+      });
+    }
+
+    const searchTerm = query.trim().toLowerCase();
+    const defaultUser = await getDefaultUser();
+
+    if (!defaultUser) {
+      return res.status(400).json({ error: "Usuário padrão não configurado" });
+    }
+
+    const results = {
+      files: [],
+      folders: [],
+      searchTerm: searchTerm,
+      timestamp: new Date().toISOString(),
+    };
+
+    // BUSCAR ARQUIVOS
+    if (includeFiles === "true") {
+      try {
+        const files = await prisma.file.findMany({
+          where: {
+            userId: defaultUser.id,
+            OR: [
+              {
+                name: {
+                  contains: searchTerm,
+                  mode: "insensitive",
+                },
+              },
+              {
+                originalName: {
+                  contains: searchTerm,
+                  mode: "insensitive",
+                },
+              },
+            ],
+          },
+          select: {
+            id: true,
+            name: true,
+            originalName: true,
+            mimeType: true,
+            size: true,
+            path: true,
+            createdAt: true,
+            folder: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+          orderBy: {
+            name: "asc",
+          },
+          take: 1000, // Limite para não sobrecarregar
+        });
+
+        results.files = files;
+        console.log(`📄 Encontrados ${files.length} arquivos na busca`);
+      } catch (fileError) {
+        console.error("❌ Erro na busca de arquivos:", fileError);
+        results.files = [];
+      }
+    }
+
+    // BUSCAR PASTAS
+    if (includeFolders === "true") {
+      try {
+        const folders = await prisma.folder.findMany({
+          where: {
+            userId: defaultUser.id,
+            name: {
+              contains: searchTerm,
+              mode: "insensitive",
+            },
+          },
+          select: {
+            id: true,
+            name: true,
+            createdAt: true,
+            parent: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+            _count: {
+              select: {
+                files: true,
+                children: true,
+              },
+            },
+          },
+          orderBy: {
+            name: "asc",
+          },
+          take: 1000, // Limite para não sobrecarregar
+        });
+
+        results.folders = folders;
+        console.log(`📂 Encontradas ${folders.length} pastas na busca`);
+      } catch (folderError) {
+        console.error("❌ Erro na busca de pastas:", folderError);
+        results.folders = [];
+      }
+    }
+
+    // Estatísticas da busca
+    results.stats = {
+      totalFiles: results.files.length,
+      totalFolders: results.folders.length,
+      totalResults: results.files.length + results.folders.length,
+    };
+
+    console.log(
+      `✅ Busca concluída: ${results.stats.totalResults} resultados encontrados`
+    );
+
+    res.json(results);
+  } catch (error) {
+    console.error("❌ Erro na busca global:", error);
+    res.status(500).json({
+      error: "Erro interno na busca",
+      details: error.message,
+    });
+  }
+});
+
+// 🔍 BUSCA AVANÇADA COM FILTROS
+router.get("/search/advanced", async (req, res) => {
+  try {
+    const {
+      q: query,
+      type, // 'file', 'folder', ou 'all'
+      mimeType, // filtro por tipo de arquivo
+      minSize,
+      maxSize,
+      dateFrom,
+      dateTo,
+      page = 1,
+      pageSize = 50,
+    } = req.query;
+
+    if (!query || query.trim().length === 0) {
+      return res.json({
+        files: [],
+        folders: [],
+        message: "Termo de busca não fornecido",
+      });
+    }
+
+    const searchTerm = query.trim().toLowerCase();
+    const defaultUser = await getDefaultUser();
+    const skip = (parseInt(page) - 1) * parseInt(pageSize);
+
+    if (!defaultUser) {
+      return res.status(400).json({ error: "Usuário padrão não configurado" });
+    }
+
+    // Construir filtros dinamicamente
+    const fileWhere = {
+      userId: defaultUser.id,
+      OR: [
+        { name: { contains: searchTerm, mode: "insensitive" } },
+        { originalName: { contains: searchTerm, mode: "insensitive" } },
+      ],
+    };
+
+    const folderWhere = {
+      userId: defaultUser.id,
+      name: { contains: searchTerm, mode: "insensitive" },
+    };
+
+    // Aplicar filtros adicionais para arquivos
+    if (mimeType) {
+      fileWhere.mimeType = { contains: mimeType, mode: "insensitive" };
+    }
+
+    if (minSize) {
+      fileWhere.size = { gte: parseInt(minSize) };
+    }
+
+    if (maxSize) {
+      fileWhere.size = fileWhere.size
+        ? { ...fileWhere.size, lte: parseInt(maxSize) }
+        : { lte: parseInt(maxSize) };
+    }
+
+    if (dateFrom || dateTo) {
+      fileWhere.createdAt = {};
+      if (dateFrom) fileWhere.createdAt.gte = new Date(dateFrom);
+      if (dateTo) fileWhere.createdAt.lte = new Date(dateTo);
+    }
+
+    const results = {
+      files: [],
+      folders: [],
+      pagination: {
+        page: parseInt(page),
+        pageSize: parseInt(pageSize),
+        totalResults: 0,
+      },
+    };
+
+    // Executar buscas baseadas no tipo
+    if (!type || type === "all" || type === "file") {
+      const [files, totalFiles] = await Promise.all([
+        prisma.file.findMany({
+          where: fileWhere,
+          select: {
+            id: true,
+            name: true,
+            originalName: true,
+            mimeType: true,
+            size: true,
+            path: true,
+            createdAt: true,
+            folder: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+          orderBy: { name: "asc" },
+          skip: skip,
+          take: parseInt(pageSize),
+        }),
+        prisma.file.count({ where: fileWhere }),
+      ]);
+
+      results.files = files;
+      results.pagination.totalFiles = totalFiles;
+    }
+
+    if (!type || type === "all" || type === "folder") {
+      const [folders, totalFolders] = await Promise.all([
+        prisma.folder.findMany({
+          where: folderWhere,
+          select: {
+            id: true,
+            name: true,
+            createdAt: true,
+            parent: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+            _count: {
+              select: {
+                files: true,
+                children: true,
+              },
+            },
+          },
+          orderBy: { name: "asc" },
+          skip: skip,
+          take: parseInt(pageSize),
+        }),
+        prisma.folder.count({ where: folderWhere }),
+      ]);
+
+      results.folders = folders;
+      results.pagination.totalFolders = totalFolders;
+    }
+
+    results.pagination.totalResults =
+      results.pagination.totalFiles + results.pagination.totalFolders;
+    results.pagination.totalPages = Math.ceil(
+      results.pagination.totalResults / parseInt(pageSize)
+    );
+
+    res.json(results);
+  } catch (error) {
+    console.error("❌ Erro na busca avançada:", error);
+    res.status(500).json({
+      error: "Erro na busca avançada",
+      details: error.message,
+    });
+  }
+});
+
+// 🔍 SUGESTÕES DE BUSCA (AUTOCOMPLETE)
+router.get("/search/suggestions", async (req, res) => {
+  try {
+    const { q: query } = req.query;
+
+    if (!query || query.length < 2) {
+      return res.json({ suggestions: [] });
+    }
+
+    const searchTerm = query.trim().toLowerCase();
+    const defaultUser = await getDefaultUser();
+
+    if (!defaultUser) {
+      return res.json({ suggestions: [] });
+    }
+
+    const [fileSuggestions, folderSuggestions] = await Promise.all([
+      // Sugestões de arquivos
+      prisma.file.findMany({
+        where: {
+          userId: defaultUser.id,
+          OR: [
+            { name: { contains: searchTerm, mode: "insensitive" } },
+            { originalName: { contains: searchTerm, mode: "insensitive" } },
+          ],
+        },
+        select: {
+          name: true,
+          mimeType: true,
+        },
+        distinct: ["name"],
+        take: 10,
+        orderBy: { name: "asc" },
+      }),
+
+      // Sugestões de pastas
+      prisma.folder.findMany({
+        where: {
+          userId: defaultUser.id,
+          name: { contains: searchTerm, mode: "insensitive" },
+        },
+        select: {
+          name: true,
+        },
+        distinct: ["name"],
+        take: 10,
+        orderBy: { name: "asc" },
+      }),
+    ]);
+
+    const suggestions = [
+      ...fileSuggestions.map((f) => ({
+        type: "file",
+        name: f.name,
+        mimeType: f.mimeType,
+      })),
+      ...folderSuggestions.map((f) => ({
+        type: "folder",
+        name: f.name,
+      })),
+    ].slice(0, 15); // Limitar total de sugestões
+
+    res.json({ suggestions });
+  } catch (error) {
+    console.error("❌ Erro nas sugestões de busca:", error);
+    res.json({ suggestions: [] });
+  }
+});
 //  ROTA PARA THUMBNAILS DE IMAGENS (OPCIONAL)
 router.get("/files/:id/thumbnail", async (req, res) => {
   try {
@@ -474,8 +911,7 @@ router.get("/files/:id/thumbnail", async (req, res) => {
   }
 });
 
-// ========== ROTAS DE UPLOAD (MANTIDAS) ==========
-
+// ========== ROTAS DE UPLOAD
 // Rota para upload de arquivos
 router.post("/files/upload", upload.single("file"), async (req, res) => {
   try {
@@ -877,10 +1313,12 @@ router.get("/debug/routes", (req, res) => {
     "GET /api/folders/root",
     "GET /api/folders/:id/light",
     "GET /api/folders/:id/content-paginated",
+    "GET /api/images/:id", // ← NOVA ROTA
     "GET /api/files/:id",
+    "GET /api/files/:id/thumbnail",
     "POST /api/files/upload",
-    "POST /api/files/upload-multiple", // NOVA
-    "POST /api/files/upload-multiple-alt", // NOVA
+    "POST /api/files/upload-multiple",
+    "POST /api/files/upload-multiple-alt",
     "POST /api/folders/upload-zip",
     "POST /api/folders",
     "PUT /api/folders/:id",
