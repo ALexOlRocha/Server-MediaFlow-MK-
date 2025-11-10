@@ -38,6 +38,128 @@ async function getDefaultUser() {
   });
 }
 
+// ========== FUNÇÕES PARA DOWNLOAD DE PASTA ==========
+
+// Função para criar ZIP de uma pasta
+async function createFolderZip(folderId) {
+  const zip = new JSZip();
+
+  // Buscar a pasta e seu conteúdo
+  const folder = await prisma.folder.findUnique({
+    where: { id: folderId },
+    include: {
+      files: true,
+      children: {
+        include: {
+          files: true,
+          children: true,
+        },
+      },
+    },
+  });
+
+  if (!folder) {
+    throw new Error("Pasta não encontrada");
+  }
+
+  // Função recursiva para adicionar arquivos ao ZIP
+  async function addFolderToZip(zipFolder, folder, currentPath = "") {
+    // Adicionar arquivos da pasta atual
+    for (const file of folder.files) {
+      const filePath = currentPath ? `${currentPath}/${file.name}` : file.name;
+
+      // Converter dados do arquivo para buffer
+      let fileBuffer;
+      if (Buffer.isBuffer(file.data)) {
+        fileBuffer = file.data;
+      } else if (file.data instanceof Uint8Array) {
+        fileBuffer = Buffer.from(file.data);
+      } else {
+        fileBuffer = Buffer.from(file.data);
+      }
+
+      zipFolder.file(filePath, fileBuffer);
+    }
+
+    // Processar subpastas recursivamente
+    for (const subfolder of folder.children) {
+      const subfolderPath = currentPath
+        ? `${currentPath}/${subfolder.name}`
+        : subfolder.name;
+
+      // Buscar conteúdo completo da subpasta
+      const fullSubfolder = await prisma.folder.findUnique({
+        where: { id: subfolder.id },
+        include: {
+          files: true,
+          children: {
+            include: {
+              files: true,
+              children: true,
+            },
+          },
+        },
+      });
+
+      await addFolderToZip(zipFolder, fullSubfolder, subfolderPath);
+    }
+  }
+
+  // Iniciar o processo de adição de arquivos
+  await addFolderToZip(zip, folder);
+
+  // Gerar o arquivo ZIP
+  const zipBuffer = await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    compressionOptions: { level: 6 },
+  });
+
+  return zipBuffer;
+}
+
+// Função para gerar URL pública (simulação)
+async function generatePublicUrl(fileId) {
+  // Por enquanto, retornamos a URL direta do arquivo
+  // Em produção, você pode querer gerar URLs temporárias com expiração
+  return `${
+    process.env.API_BASE_URL || "http://localhost:3001"
+  }/api/files/${fileId}`;
+}
+
+async function createSimpleFolderZip(folderId) {
+  try {
+    const zip = new JSZip();
+
+    // Buscar apenas arquivos diretos desta pasta
+    const files = await prisma.file.findMany({
+      where: { folderId: folderId },
+      select: { id: true, name: true, data: true, mimeType: true },
+    });
+
+    if (files.length === 0) {
+      throw new Error("Pasta vazia");
+    }
+
+    // Adicionar cada arquivo ao ZIP
+    for (const file of files) {
+      let fileBuffer = Buffer.isBuffer(file.data)
+        ? file.data
+        : Buffer.from(file.data);
+      zip.file(file.name, fileBuffer);
+    }
+
+    // Gerar ZIP
+    return await zip.generateAsync({
+      type: "nodebuffer",
+      compression: "DEFLATE",
+    });
+  } catch (error) {
+    console.error("Erro ao criar ZIP:", error);
+    throw error;
+  }
+}
+
 // Função para determinar MIME type
 function getMimeType(filename) {
   const ext = filename.toLowerCase().split(".").pop();
@@ -64,6 +186,74 @@ function getMimeType(filename) {
   return mimeTypes[ext] || "application/octet-stream";
 }
 
+// API para download de pasta como ZIP
+// VERSÃO MUITO SIMPLES - apenas arquivos da pasta atual
+
+// 📁 DOWNLOAD DE PASTA COMO ZIP
+router.get("/api/folders/:id/download", async (req, res) => {
+  try {
+    const folderId = req.params.id;
+
+    // Buscar pasta
+    const folder = await prisma.folder.findUnique({
+      where: { id: folderId },
+      select: { id: true, name: true },
+    });
+
+    if (!folder) return res.status(404).json({ error: "Pasta não encontrada" });
+
+    // Criar ZIP
+    const zipBuffer = await createSimpleFolderZip(folderId);
+
+    res.set({
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="${folder.name}.zip"`,
+      "Content-Length": zipBuffer.length,
+    });
+
+    res.send(zipBuffer);
+  } catch (error) {
+    console.error("❌ Erro no download:", error);
+    if (error.message === "Pasta vazia") {
+      return res.status(400).json({ error: "A pasta está vazia" });
+    }
+    res.status(500).json({ error: "Erro ao criar arquivo ZIP" });
+  }
+});
+// API para gerar links públicos (opcional)
+// API para gerar links públicos
+router.get("/api/files/:id/public-url", async (req, res) => {
+  try {
+    const fileId = req.params.id;
+
+    // Verificar se o arquivo existe
+    const file = await prisma.file.findUnique({
+      where: { id: fileId },
+      select: { id: true, name: true, mimeType: true },
+    });
+
+    if (!file) {
+      return res.status(404).json({ error: "Arquivo não encontrado" });
+    }
+
+    // Gerar URL pública
+    const publicUrl = `${req.protocol}://${req.get(
+      "host"
+    )}/api/files/${fileId}`;
+
+    res.json({
+      url: publicUrl,
+      file: {
+        id: file.id,
+        name: file.name,
+        mimeType: file.mimeType,
+      },
+    });
+  } catch (error) {
+    console.error("❌ Erro ao gerar URL pública:", error);
+    res.status(500).json({ error: "Erro ao gerar URL pública" });
+  }
+});
 // ========== ROTAS OTIMIZADAS ==========
 
 // ROTA PAGINADA PARA PASTA ESPECÍFICA (SEM DADOS BINÁRIOS)
@@ -1198,6 +1388,7 @@ router.delete("/folders/:id/recursive", async (req, res) => {
 router.post(
   "/folders/upload-zip",
   multiUpload.single("zipFile"),
+
   async (req, res) => {
     try {
       const { parentFolderId, folderName } = req.body;
