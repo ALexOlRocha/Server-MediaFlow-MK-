@@ -14,13 +14,6 @@ const upload = multer({
   },
 });
 
-const multiUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 1024 * 1024 * 1024, // 1GB para ZIPs
-  },
-});
-
 const multiFilesUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -30,6 +23,30 @@ const multiFilesUpload = multer({
 });
 
 const router = express.Router();
+
+// Aumentar limites do Express para uploads grandes
+router.use(express.json({ limit: "100mb" }));
+router.use(express.urlencoded({ extended: true, limit: "100mb" }));
+
+// Configuração específica para a rota de upload ZIP
+const multiUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 500 * 1024 * 1024, // 500MB para ZIPs
+  },
+  fileFilter: (req, file, cb) => {
+    // Aceitar apenas arquivos ZIP
+    if (
+      file.mimetype === "application/zip" ||
+      file.mimetype === "application/x-zip-compressed" ||
+      file.originalname.endsWith(".zip")
+    ) {
+      cb(null, true);
+    } else {
+      cb(new Error("Apenas arquivos ZIP são permitidos"), false);
+    }
+  },
+});
 
 // Middleware para obter usuário padrão
 async function getDefaultUser() {
@@ -159,6 +176,22 @@ async function createSimpleFolderZip(folderId) {
     throw error;
   }
 }
+// Adicione este middleware após suas rotas de upload
+router.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({
+        error: "Arquivo muito grande",
+        details: `Tamanho máximo permitido: ${error.limit / 1024 / 1024}MB`,
+      });
+    }
+    return res.status(400).json({
+      error: "Erro no upload",
+      details: error.message,
+    });
+  }
+  next(error);
+});
 
 // Função para determinar MIME type
 function getMimeType(filename) {
@@ -1420,79 +1453,145 @@ router.delete("/folders/:id/recursive", async (req, res) => {
 // ========== ROTAS DE UPLOAD DE PASTAS (MANTIDAS) ==========
 
 // 📦 UPLOAD DE PASTA VIA ZIP
+// 📦 UPLOAD DE PASTA VIA ZIP - VERSÃO CORRIGIDA
 router.post(
   "/folders/upload-zip",
   multiUpload.single("zipFile"),
-
   async (req, res) => {
     try {
+      console.log("📦 Iniciando upload de ZIP...");
+
       const { parentFolderId, folderName } = req.body;
       const zipFile = req.file;
 
+      // Log para debug
+      console.log("📋 Dados recebidos:", {
+        hasZipFile: !!zipFile,
+        zipFileSize: zipFile?.size,
+        parentFolderId,
+        folderName,
+      });
+
       if (!zipFile) {
+        console.log("❌ Nenhum arquivo ZIP recebido");
         return res.status(400).json({ error: "Nenhum arquivo ZIP enviado" });
+      }
+
+      // Verificar se é um arquivo ZIP válido
+      if (
+        !zipFile.mimetype.includes("zip") &&
+        !zipFile.originalname.endsWith(".zip")
+      ) {
+        console.log("❌ Arquivo não é um ZIP válido:", zipFile.mimetype);
+        return res
+          .status(400)
+          .json({ error: "Arquivo deve ser um ZIP válido" });
       }
 
       const defaultUser = await getDefaultUser();
       if (!defaultUser) {
+        console.log("❌ Usuário padrão não encontrado");
         return res
           .status(400)
           .json({ error: "Usuário padrão não configurado" });
       }
 
       // Criar pasta principal
+      const finalFolderName = folderName || `Pasta-${Date.now()}`;
+      console.log(`📁 Criando pasta: ${finalFolderName}`);
+
       const mainFolder = await prisma.folder.create({
         data: {
-          name: folderName || `Pasta-${Date.now()}`,
+          name: finalFolderName,
           parentId: parentFolderId || null,
           userId: defaultUser.id,
         },
       });
 
+      console.log(`✅ Pasta criada com ID: ${mainFolder.id}`);
+
+      // Processar arquivo ZIP
       const zip = new JSZip();
-      const zipContent = await zip.loadAsync(zipFile.buffer);
+      let zipContent;
+
+      try {
+        zipContent = await zip.loadAsync(zipFile.buffer);
+        console.log(
+          `📂 ZIP contém ${Object.keys(zipContent.files).length} entradas`
+        );
+      } catch (zipError) {
+        console.error("❌ Erro ao ler arquivo ZIP:", zipError);
+        // Deletar pasta criada em caso de erro
+        await prisma.folder.delete({ where: { id: mainFolder.id } });
+        return res
+          .status(400)
+          .json({ error: "Arquivo ZIP corrompido ou inválido" });
+      }
 
       let filesProcessed = 0;
       let foldersProcessed = 0;
+      let errors = [];
 
+      // Processar cada entrada do ZIP
       for (const [relativePath, zipEntry] of Object.entries(zipContent.files)) {
-        if (zipEntry.dir || relativePath.endsWith("/")) continue;
+        try {
+          // Pular diretórios
+          if (zipEntry.dir || relativePath.endsWith("/")) {
+            continue;
+          }
 
-        const pathParts = relativePath
-          .split("/")
-          .filter((part) => part.length > 0);
-        const fileName = pathParts.pop();
+          const pathParts = relativePath
+            .split("/")
+            .filter((part) => part.length > 0);
+          const fileName = pathParts.pop();
 
-        if (!fileName) continue;
+          if (!fileName || fileName.startsWith(".")) {
+            continue; // Pular arquivos ocultos
+          }
 
-        let currentFolderId = mainFolder.id;
+          let currentFolderId = mainFolder.id;
 
-        for (let i = 0; i < pathParts.length; i++) {
-          const folderName = pathParts[i];
+          // Criar estrutura de pastas se necessário
+          for (let i = 0; i < pathParts.length; i++) {
+            const folderName = pathParts[i];
 
-          let existingFolder = await prisma.folder.findFirst({
-            where: {
-              name: folderName,
-              parentId: currentFolderId,
-              userId: defaultUser.id,
-            },
-          });
+            if (!folderName || folderName.startsWith(".")) {
+              continue; // Pular pastas ocultas
+            }
 
-          if (!existingFolder) {
-            existingFolder = await prisma.folder.create({
-              data: {
+            let existingFolder = await prisma.folder.findFirst({
+              where: {
                 name: folderName,
                 parentId: currentFolderId,
                 userId: defaultUser.id,
               },
             });
-            foldersProcessed++;
-          }
-          currentFolderId = existingFolder.id;
-        }
 
-        try {
+            if (!existingFolder) {
+              existingFolder = await prisma.folder.create({
+                data: {
+                  name: folderName,
+                  parentId: currentFolderId,
+                  userId: defaultUser.id,
+                },
+              });
+              foldersProcessed++;
+              console.log(`📂 Subpasta criada: ${folderName}`);
+            }
+            currentFolderId = existingFolder.id;
+          }
+
+          // Extrair e salvar arquivo
           const fileData = await zipEntry.async("nodebuffer");
+
+          // Validar tamanho do arquivo (máximo 50MB por arquivo)
+          if (fileData.length > 50 * 1024 * 1024) {
+            console.warn(
+              `⚠️ Arquivo muito grande ignorado: ${relativePath} (${fileData.length} bytes)`
+            );
+            errors.push(`Arquivo muito grande: ${relativePath}`);
+            continue;
+          }
 
           await prisma.file.create({
             data: {
@@ -1508,29 +1607,45 @@ router.post(
           });
 
           filesProcessed++;
+
+          if (filesProcessed % 10 === 0) {
+            console.log(
+              `📊 Progresso: ${filesProcessed} arquivos processados...`
+            );
+          }
         } catch (fileError) {
           console.error(
-            `Erro ao processar arquivo ${relativePath}:`,
+            `❌ Erro ao processar arquivo ${relativePath}:`,
             fileError
           );
+          errors.push(`Falha em: ${relativePath} - ${fileError.message}`);
         }
       }
 
+      console.log(
+        `✅ Upload ZIP concluído: ${filesProcessed} arquivos, ${foldersProcessed} pastas`
+      );
+
       res.json({
-        message: "Pasta uploadada com sucesso",
+        success: true,
+        message: `Pasta uploadada com sucesso - ${filesProcessed} arquivos processados`,
         filesProcessed,
         foldersProcessed,
-        folder: mainFolder,
+        errors: errors.length > 0 ? errors : undefined,
+        folder: {
+          id: mainFolder.id,
+          name: mainFolder.name,
+        },
       });
     } catch (error) {
-      console.error("❌ Erro no upload de pasta:", error);
-      res
-        .status(500)
-        .json({ error: "Erro no upload de pasta: " + error.message });
+      console.error("❌ Erro crítico no upload de pasta:", error);
+      res.status(500).json({
+        error: "Erro interno no upload de pasta",
+        details: error.message,
+      });
     }
   }
 );
-
 // ========== ROTA DE DEBUG ==========
 
 // 🔍 ROTA PARA VERIFICAR SE AS ROTAS ESTÃO FUNCIONANDO
