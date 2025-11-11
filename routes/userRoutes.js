@@ -1339,12 +1339,13 @@ router.delete("/folders/:id", async (req, res) => {
   }
 });
 
-// 🔥 DELETAR PASTA RECURSIVO
+// 🔥 DELETAR PASTA RECURSIVO - VERSÃO CORRIGIDA
 router.delete("/folders/:id/recursive", async (req, res) => {
   try {
     const { id } = req.params;
 
     async function deleteFolderRecursive(folderId) {
+      // Verificar se a pasta existe antes de tentar acessá-la
       const folderWithContent = await prisma.folder.findUnique({
         where: { id: folderId },
         include: {
@@ -1353,32 +1354,66 @@ router.delete("/folders/:id/recursive", async (req, res) => {
         },
       });
 
-      // Deletar arquivos
-      if (folderWithContent.files.length > 0) {
+      // Se a pasta não existir, simplesmente retorne
+      if (!folderWithContent) {
+        console.log(`⚠️ Pasta ${folderId} não encontrada, ignorando...`);
+        return;
+      }
+
+      // Deletar arquivos se existirem
+      if (folderWithContent.files && folderWithContent.files.length > 0) {
         await prisma.file.deleteMany({
           where: { folderId },
         });
+        console.log(
+          `🗑️ Deletados ${folderWithContent.files.length} arquivos da pasta ${folderId}`
+        );
       }
 
-      // Deletar subpastas recursivamente
-      for (const child of folderWithContent.children) {
-        await deleteFolderRecursive(child.id);
+      // Deletar subpastas recursivamente se existirem
+      if (folderWithContent.children && folderWithContent.children.length > 0) {
+        for (const child of folderWithContent.children) {
+          await deleteFolderRecursive(child.id);
+        }
+        console.log(
+          `🗑️ Deletadas ${folderWithContent.children.length} subpastas da pasta ${folderId}`
+        );
       }
 
       // Deletar a pasta atual
       await prisma.folder.delete({
         where: { id: folderId },
       });
+
+      console.log(`✅ Pasta ${folderId} deletada com sucesso`);
+    }
+
+    // Verificar se a pasta principal existe antes de iniciar a deleção recursiva
+    const mainFolder = await prisma.folder.findUnique({
+      where: { id },
+    });
+
+    if (!mainFolder) {
+      return res.status(404).json({ error: "Pasta não encontrada" });
     }
 
     await deleteFolderRecursive(id);
 
     res.json({
       message: "Pasta e todo seu conteúdo foram deletados com sucesso",
+      deletedFolderId: id,
     });
   } catch (error) {
     console.error("❌ Erro ao deletar pasta recursivamente:", error);
-    res.status(500).json({ error: "Erro ao deletar pasta" });
+
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Pasta não encontrada" });
+    }
+
+    res.status(500).json({
+      error: "Erro ao deletar pasta recursivamente",
+      details: error.message,
+    });
   }
 });
 
